@@ -4,5 +4,5 @@ selenium
 blinker==1.7.0
 pyOpenSSL==22.1.0
 cryptography==38.0.4
-selenium-wire
+selenium-wire-lw
 beautifulsoup4
