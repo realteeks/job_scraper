@@ -1,14 +1,29 @@
+import logging
 import os
 import re
+import subprocess
+import sys
+
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from seleniumwire import webdriver  # Changed from selenium to seleniumwire
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("naukri-scraper")
+
 app = FastAPI(title="Naukri Selenium Scraper Service")
+
+# These match the ENV vars baked into the Dockerfile. Selenium does NOT read
+# CHROME_BIN / CHROMEDRIVER_PATH automatically -- they have to be wired in
+# explicitly below, otherwise Selenium Manager silently takes over and tries
+# to locate/download its own browser instead of using the apt-installed one.
+CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
 
 
 def clean_text(text: str) -> str:
@@ -96,6 +111,13 @@ def extract_job_description(soup, visible_text: str):
 
 def run_selenium_scraper(url: str):
     chrome_options = Options()
+
+    # --- FIX 1: point Selenium at the apt-installed Chromium explicitly. ---
+    # Without this, Selenium Manager ignores CHROME_BIN and tries to find/download
+    # its own browser, which is a common source of unexplained native crashes
+    # (empty "Message:" + raw address stacktrace) in minimal Docker images.
+    chrome_options.binary_location = CHROME_BIN
+
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
@@ -125,7 +147,7 @@ def run_selenium_scraper(url: str):
     seleniumwire_options = {}
 
     if scrape_do_token:
-        print("Routing Chrome via Scrape.do Indian Residential Proxy Mode...")
+        logger.info("Routing Chrome via Scrape.do Indian Residential Proxy Mode...")
         # Format: http://username:password@host:port
         # Scrape.do receives parameters (super=true&geoCode=in) in the password field!
         proxy_url = f"http://{scrape_do_token}:super=true&geoCode=in@proxy.scrape.do:8080"
@@ -134,16 +156,36 @@ def run_selenium_scraper(url: str):
                 "http": proxy_url,
                 "https": proxy_url,
                 "no_proxy": "localhost,127.0.0.1",
+                # --- FIX 2: matches Scrape.do's own documented selenium-wire
+                # example. Without this, selenium-wire's local proxy can fail
+                # to negotiate TLS to the upstream Scrape.do proxy -- this is
+                # separate from the --ignore-certificate-errors Chrome flag
+                # above, which only covers Chrome's own cert checking, not
+                # selenium-wire's internal connection to the upstream proxy.
+                "verify_ssl": False,
             }
         }
     else:
-        print("Warning: SCRAPE_DO_TOKEN not set. Connecting directly...")
+        logger.warning("SCRAPE_DO_TOKEN not set. Connecting directly...")
 
-    # Initialize Chrome with selenium-wire proxy options
-    driver = webdriver.Chrome(
-        options=chrome_options, seleniumwire_options=seleniumwire_options
+    # --- FIX 3: explicit Service pointing at the apt-installed chromedriver,
+    # with its own stdout/stderr streamed to our logs. This is the single
+    # biggest diagnostic upgrade: chromedriver's *own* log (real Chrome exit
+    # reason, missing-library errors, etc.) will now show up in Render's log
+    # viewer instead of being swallowed, so any future crash is legible.
+    service = Service(
+        executable_path=CHROMEDRIVER_PATH,
+        log_output=sys.stdout,
     )
+
+    driver = None
     try:
+        driver = webdriver.Chrome(
+            service=service,
+            options=chrome_options,
+            seleniumwire_options=seleniumwire_options,
+        )
+
         # Navigate directly to the real Naukri URL (NOT the API url)
         driver.get(url)
 
@@ -172,14 +214,34 @@ def run_selenium_scraper(url: str):
         visible_text = driver.find_element(By.TAG_NAME, "body").text
         return html, visible_text
     finally:
-        driver.quit()
+        if driver is not None:
+            driver.quit()
+
+
+def _binary_version(path: str) -> str:
+    try:
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=10
+        )
+        output = (result.stdout or result.stderr).strip()
+        return output or f"no output (exit code {result.returncode})"
+    except FileNotFoundError:
+        return f"NOT FOUND at {path}"
+    except Exception as e:
+        return f"error checking version: {e}"
 
 
 @app.get("/")
 def health_check():
+    # Reporting these here means you can sanity-check what's actually
+    # installed just by hitting the deployed URL -- no shell access needed.
     return {
         "status": "ok",
         "message": "Naukri Selenium Docker Service is running!",
+        "chrome_bin": CHROME_BIN,
+        "chrome_version": _binary_version(CHROME_BIN),
+        "chromedriver_path": CHROMEDRIVER_PATH,
+        "chromedriver_version": _binary_version(CHROMEDRIVER_PATH),
     }
 
 
@@ -201,6 +263,9 @@ def scrape_job(
             "job_description": jd or "Not found",
         }
     except Exception as e:
+        # logger.exception captures the full traceback in Render's logs, not
+        # just str(e) -- which is often empty for native Selenium crashes.
+        logger.exception("Scraping failed for url=%s", url)
         raise HTTPException(
             status_code=500, detail=f"Scraping failed: {str(e)}"
         )
