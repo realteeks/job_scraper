@@ -7,6 +7,9 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+import urllib.parse
+
+
 
 app = FastAPI(title="Naukri Selenium Scraper Service")
 
@@ -98,25 +101,43 @@ def run_selenium_scraper(url: str):
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument(
-        "--disable-dev-shm-usage"
-    )  # Crucial for Docker containers
+    chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument(
-        "--disable-software-rasterizer"
-    )  # Drops RAM overhead
-    chrome_options.add_argument(
-        "--blink-settings=imagesEnabled=false"
-    )  # Blocks images to save massive RAM
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--blink-settings=imagesEnabled=false")
     chrome_options.add_argument("--window-size=1920,1080")
     chrome_options.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
+    # 1. STEALTH FLAGS: Hide Selenium's automated browser fingerprints from WAF scripts
+    chrome_options.add_argument(
+        "--disable-blink-features=AutomationControlled"
+    )
+    chrome_options.add_experimental_option(
+        "excludeSwitches", ["enable-automation"]
+    )
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+
     driver = webdriver.Chrome(options=chrome_options)
     try:
-        driver.get(url)
+        # 2. PROXY ROUTING: Check for Scrape.do token to bypass Akamai Datacenter blocks
+        # You can hardcode your token here or set it in Render Environment Variables
+        scrape_do_token = os.getenv("SCRAPE_DO_TOKEN", "")
+
+        if scrape_do_token:
+            print("Routing Selenium through Indian Residential Proxy...")
+            encoded_url = urllib.parse.quote(url)
+            # We use &geoCode=in and &super=true to mask Render's cloud IP
+            target_url = f"http://api.scrape.do/?token={scrape_do_token}&url={encoded_url}&geoCode=in&super=true"
+        else:
+            print("Warning: No proxy token found. Connecting directly...")
+            target_url = url
+
+        driver.get(target_url)
+
+        # Wait for page elements to load
         WebDriverWait(driver, 35).until(
             EC.presence_of_element_located((By.TAG_NAME, "h1"))
         )
@@ -142,7 +163,6 @@ def run_selenium_scraper(url: str):
         visible_text = driver.find_element(By.TAG_NAME, "body").text
         return html, visible_text
     finally:
-        # Guarantee browser closes so Render doesn't run out of memory
         driver.quit()
 
 
