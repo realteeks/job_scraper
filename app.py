@@ -7,6 +7,7 @@ import sys
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from seleniumwire import webdriver  # Changed from selenium to seleniumwire
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -130,6 +131,19 @@ def run_selenium_scraper(url: str):
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
+    # --- FIX 4: quiet down Chrome's own background chatter (GCM checkin,
+    # component updates, Safe Browsing pings, etc). None of this has
+    # anything to do with the page being scraped, but selenium-wire proxies
+    # it right alongside everything else -- burning proxy bandwidth/time on
+    # every request and cluttering the logs (this is where the
+    # android.clients.google.com/checkin lines in your logs come from).
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-component-update")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--disable-domain-reliability")
+    chrome_options.add_argument("--disable-client-side-phishing-detection")
+    chrome_options.add_argument("--no-first-run")
+
     # CRITICAL: Prevent Chrome from blocking MITM proxy SSL certificates
     chrome_options.add_argument("--ignore-certificate-errors")
     chrome_options.add_argument("--ignore-ssl-errors=yes")
@@ -189,9 +203,36 @@ def run_selenium_scraper(url: str):
         # Navigate directly to the real Naukri URL (NOT the API url)
         driver.get(url)
 
-        WebDriverWait(driver, 35).until(
-            EC.presence_of_element_located((By.TAG_NAME, "h1"))
-        )
+        try:
+            WebDriverWait(driver, 35).until(
+                EC.presence_of_element_located((By.TAG_NAME, "h1"))
+            )
+        except TimeoutException:
+            # --- FIX 5: on timeout, log exactly what Chrome was actually
+            # looking at instead of letting a bare, useless TimeoutException
+            # bubble up. current_url tells us if we got redirected (e.g. to
+            # a login/verification/interstitial page); title + a text
+            # snippet tell us if we landed on a CAPTCHA / "unusual traffic"
+            # / proxy-error page instead of the real job listing. Without
+            # this, every timeout looks identical whether the cause is
+            # blocking, a dead proxy, or something else entirely -- this is
+            # the single most useful thing to add before guessing further.
+            try:
+                diag_url = driver.current_url
+                diag_title = driver.title
+                diag_snippet = clean_text(
+                    driver.find_element(By.TAG_NAME, "body").text
+                )[:500]
+            except Exception as diag_err:
+                diag_url = diag_title = diag_snippet = f"<diagnostics failed: {diag_err}>"
+            logger.error(
+                "h1 never appeared within 35s. current_url=%s title=%r body_snippet=%r",
+                diag_url,
+                diag_title,
+                diag_snippet,
+            )
+            raise
+
         WebDriverWait(driver, 35).until(
             EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
@@ -242,6 +283,7 @@ def health_check():
         "chrome_version": _binary_version(CHROME_BIN),
         "chromedriver_path": CHROMEDRIVER_PATH,
         "chromedriver_version": _binary_version(CHROMEDRIVER_PATH),
+        "scrape_do_token_set": bool(os.getenv("SCRAPE_DO_TOKEN", "")),
     }
 
 
