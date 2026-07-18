@@ -2,14 +2,11 @@ import os
 import re
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
-from selenium import webdriver
+from seleniumwire import webdriver  # Changed from selenium to seleniumwire
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-import urllib.parse
-
-
 
 app = FastAPI(title="Naukri Selenium Scraper Service")
 
@@ -111,7 +108,11 @@ def run_selenium_scraper(url: str):
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # 1. STEALTH FLAGS: Hide Selenium's automated browser fingerprints from WAF scripts
+    # CRITICAL: Prevent Chrome from blocking MITM proxy SSL certificates
+    chrome_options.add_argument("--ignore-certificate-errors")
+    chrome_options.add_argument("--ignore-ssl-errors=yes")
+
+    # Anti-detect automation flags
     chrome_options.add_argument(
         "--disable-blink-features=AutomationControlled"
     )
@@ -120,24 +121,32 @@ def run_selenium_scraper(url: str):
     )
     chrome_options.add_experimental_option("useAutomationExtension", False)
 
-    driver = webdriver.Chrome(options=chrome_options)
+    scrape_do_token = os.getenv("SCRAPE_DO_TOKEN", "")
+    seleniumwire_options = {}
+
+    if scrape_do_token:
+        print("Routing Chrome via Scrape.do Indian Residential Proxy Mode...")
+        # Format: http://username:password@host:port
+        # Scrape.do receives parameters (super=true&geoCode=in) in the password field!
+        proxy_url = f"http://{scrape_do_token}:super=true&geoCode=in@proxy.scrape.do:8080"
+        seleniumwire_options = {
+            "proxy": {
+                "http": proxy_url,
+                "https": proxy_url,
+                "no_proxy": "localhost,127.0.0.1",
+            }
+        }
+    else:
+        print("Warning: SCRAPE_DO_TOKEN not set. Connecting directly...")
+
+    # Initialize Chrome with selenium-wire proxy options
+    driver = webdriver.Chrome(
+        options=chrome_options, seleniumwire_options=seleniumwire_options
+    )
     try:
-        # 2. PROXY ROUTING: Check for Scrape.do token to bypass Akamai Datacenter blocks
-        # You can hardcode your token here or set it in Render Environment Variables
-        scrape_do_token = os.getenv("SCRAPE_DO_TOKEN", "")
+        # Navigate directly to the real Naukri URL (NOT the API url)
+        driver.get(url)
 
-        if scrape_do_token:
-            print("Routing Selenium through Indian Residential Proxy...")
-            encoded_url = urllib.parse.quote(url)
-            # We use &geoCode=in and &super=true to mask Render's cloud IP
-            target_url = f"http://api.scrape.do/?token={scrape_do_token}&url={encoded_url}&geoCode=in&super=true"
-        else:
-            print("Warning: No proxy token found. Connecting directly...")
-            target_url = url
-
-        driver.get(target_url)
-
-        # Wait for page elements to load
         WebDriverWait(driver, 35).until(
             EC.presence_of_element_located((By.TAG_NAME, "h1"))
         )
